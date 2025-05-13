@@ -2,12 +2,20 @@
 
 """Pretrain GPT."""
 
-from functools import partial
-from typing import List, Optional, Tuple, Union
-
+import datetime
+import os
 import torch
 
+from functools import partial
+from typing import List, Optional, Tuple, Union
 from megatron.core import parallel_state
+from megatron.training import get_args
+from megatron.training import inprocess_restart
+from megatron.training import print_rank_0
+from megatron.training import get_timers
+from megatron.training import get_tokenizer
+from megatron.core import mpu
+from megatron.core.enums import ModelType
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
@@ -50,7 +58,7 @@ stimer = StragglerDetector()
 
 
 def model_provider(
-    pre_process=True, post_process=True
+    pre_process=True, post_process=True, vp_stage: Optional[int] = None
 ) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
     """Builds the model.
 
@@ -159,6 +167,7 @@ def model_provider(
             rotary_base=args.rotary_base,
             rope_scaling=args.use_rope_scaling,
             mtp_block_spec=mtp_block_spec,
+            vp_stage=vp_stage,
         )
 
     return model
@@ -342,6 +351,9 @@ if __name__ == "__main__":
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True
 
+    # Optionally enable inprocess restart on pretrain
+    pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
+
     pretrain(
         train_valid_test_datasets_provider,
         model_provider,
@@ -349,4 +361,5 @@ if __name__ == "__main__":
         forward_step,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
         extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
+        store=store,
     )
