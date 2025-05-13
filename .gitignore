@@ -12,3 +12,8 @@ local/
 wandb/
 onelogger.log
 onelogger.err
+share_files/
+*.sh.*
+data/
+output/
+checkpoints/
