@@ -3,7 +3,7 @@ format_version: 1
 maintainers: [mcore]
 loggers: [stdout]
 spec:
-  name: "{test_case}_{environment}"
+  name: "{test_case}_{environment}_{platforms}"
   model: gpt
   build: mcore-pyt-{environment}
   nodes: 1
@@ -45,11 +45,12 @@ spec:
         "DATA_CACHE_PATH=/workspace/data/cache"
         "TRAINING_SCRIPT_PATH=examples/inference/gpt/gpt_static_inference.py"
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
-        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}.json"
+        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
         "OUTPUT_PATH={assets_dir}"
         "TENSORBOARD_PATH={assets_dir}/generations.json"
         "N_REPEAT={n_repeat}"
         "ENABLE_LIGHTWEIGHT_MODE=false"
+        "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS}}"
     )
 
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
@@ -59,3 +60,4 @@ products:
     products:
       - environment: [dev]
         scope: [mr]
+        platforms: [dgx_a100, dgx_h100]

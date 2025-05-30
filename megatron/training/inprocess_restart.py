@@ -25,7 +25,7 @@ def destroy_state():
     rerun_state_machine.destroy_rerun_state_machine()
 
 
-def inprocess_restart(train):
+def inprocess_restart(train, args):
     if inprocess is None:
         warnings.warn('In-process restart is not available')
         return train
@@ -37,8 +37,6 @@ def inprocess_restart(train):
         warnings.warn(
             'Set TORCH_CPP_LOG_LEVEL=error to suppress c10d waitForInput timeout warning messages'
         )
-
-    args = arguments.parse_args()
 
     # Layers represents a configuration for a layer of branches at a certain
     # depth in a topology tree constructed by inprocess.rank_assignment.Tree.
@@ -116,10 +114,10 @@ def inprocess_restart(train):
 
 def maybe_wrap_for_inprocess_restart(pretrain):
 
-    args = arguments.parse_args()
+    args = arguments.parse_args(ignore_unknown_args=True)
 
     if args.inprocess_restart:
-        pretrain = inprocess_restart(pretrain)
+        pretrain = inprocess_restart(pretrain, args)
 
         store = torch.distributed.TCPStore(
             host_name=os.environ['MASTER_ADDR'],

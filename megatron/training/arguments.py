@@ -7,6 +7,7 @@ import dataclasses
 import json
 import os
 from pathlib import Path
+import re
 import types
 import warnings
 
@@ -258,6 +259,16 @@ def load_retro_args(args):
     args.retro_bert_tokenizer_type = retro_config.retro_bert_tokenizer_type
     args.retro_bert_vocab_file = retro_config.retro_bert_vocab_file
 
+def _eval_pattern(pattern):
+    """ Validate and evaluate a string containing a Python list expression """
+    assert isinstance(pattern, str)
+
+    # validate input, only allow comma, digits, [, ], (, ), +, and *
+    if bool(re.compile(r'[^,\d\[\]\(\)\+\*]').search(pattern)):
+        raise ValueError(f"Invalid pattern: {pattern}")
+
+    return eval(pattern)
+
 def no_rope_freq_type(x):
     """ Controls which layers to skip performing Rotary Position Embedding.
     - An integer N: Represents a 1:N ratio, meaning RoPE is skipped every N-1 layers.
@@ -276,8 +287,7 @@ def no_rope_freq_type(x):
     assert isinstance(x, str)
     if '[' in x:
         # it's a custom pattern
-        pattern = eval(x)
-        return pattern
+        return _eval_pattern(x)
     else:
         # it's a single int but in str
         return int(x)
@@ -302,8 +312,7 @@ def moe_freq_type(x):
     assert isinstance(x, str)
     if '[' in x:
         # it's a custom pattern
-        pattern = eval(x)
-        return pattern
+        return _eval_pattern(x)
     else:
         # it's a single int but in str
         return int(x)
@@ -801,7 +810,8 @@ def validate_args(args, defaults={}):
 
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
-    if args.tensor_model_parallel_size > 1 or args.context_parallel_size > 1 and get_device_arch_version() < 10:
+    if (args.tensor_model_parallel_size > 1 or args.context_parallel_size > 1) \
+        and get_device_arch_version() < 10:
         # CUDA_DEVICE_MAX_CONNECTIONS requirement no longer exists since the Blackwell architecture
         if args.use_torch_fsdp2 or args.use_custom_fsdp:
             fsdp_impl = "Torch-FSDP2" if args.use_torch_fsdp2 else "Custom-FSDP"
@@ -2244,6 +2254,12 @@ def _add_distributed_args(parser):
                        'layer in the context of partition and placement for pipeline parallelism.')
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
+    group.add_argument('--use-nccl-ub', action='store_true', dest='nccl_ub', 
+                       help='Use the userbuffer registration for DP/FSDP communication buffers.'
+                       'This option will reduce GPU SM usage for the DP/FSDP communication,'
+                       'which is improving the performance of the overlapped computation.')
+    group.add_argument('--use-sharp', action='store_true', 
+                       help='Required to enable SHARP communication.')
     group.add_argument('--use-custom-fsdp', action='store_true',
                        help='Use the Megatron FSDP code path in DDP.')
     group.add_argument('--init-model-with-meta-device', action='store_true')
@@ -2252,6 +2268,11 @@ def _add_distributed_args(parser):
                        help='Sharding strategy of data parallelism.')
     group.add_argument('--no-gradient-reduce-div-fusion', action='store_false', dest='gradient_reduce_div_fusion',
                        help='If not set, fuse the division in gradient reduce.')
+    group.add_argument('--fsdp-double-buffer', action='store_true',
+                       help="Enable double buffering for temporary memory needed for custom FSDP communications. "
+                        "Double-buffering the communication memory improves memory management efficiency by "
+                        "reusing previously allocated buffers, rather than creating new buffers for each FSDP communication. "
+                        "This is required for user buffer registration and is enabled by default when using NCCL user buffers.")
     group.add_argument('--suggested-communication-unit-size', type=int, default=None,
                    help='Specifies the number of elements to communicate at once during FSDP (Fully Sharded Data Parallel) operations. '
                         'This flag also affects FSDP all-gather prefetch behavior. Setting a larger value increases the communication buffer size, '
@@ -2653,6 +2674,8 @@ def _add_moe_args(parser):
                        'The expert bias is updated based on the number of assigned tokens to each expert in a global batch, '
                        'where the bias is increased for the experts with less assigned tokens and decreased for the experts with more assigned tokens. '
                        'The default value 1e-3 is same as that used in DeepSeekV3.')
+    group.add_argument('--moe-router-force-load-balancing', action='store_true',
+                       help='[Experimental] Force override routing to balance token distribution using random logits for MoE routers, supporting naive top-k and group-limited top-k. This experimental feature is for benchmarking purposes only!')
     group.add_argument('--moe-aux-loss-coeff', type=float, default=0.0,
                        help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.')
     group.add_argument('--moe-z-loss-coeff', type=float, default=None,
