@@ -23,7 +23,6 @@ echo "NNODES=$NNODES  NPROC_PER_NODE=$NPROC_PER_NODE  WORLD_SIZE=$WORLD_SIZE"
 echo "MASTER_ADDR=$MASTER_ADDR  MASTER_PORT=$MASTER_PORT  NODE_RANK=$NODE_RANK"
 
 timestamp=$(date "+%Y%m%d%H%M%S")
-apptainer_image=/work/NBB/yu_mingzhe/pytorch_sandbox_2504_backup
 
 WORKSPACE=/work/NBB/yu_mingzhe/Megatron-LM
 script_path="$WORKSPACE/pretrain_gpt.py"
@@ -55,6 +54,7 @@ GPT_MODEL_ARGS=(
        --num-attention-heads 8 
        --seq-length 1024 
        --max-position-embeddings 1024
+       --transformer-impl "local"
 )
 
 TRAINING_ARGS=(
@@ -100,18 +100,15 @@ EVAL_AND_LOGGING_ARGS=(
 mpirun ${NQSII_MPIOPTS} --mca mpi_abort_print_stack 1 \
   -x PATH -x MASTER_ADDR -x MASTER_PORT -x WORLD_SIZE -x NODE_RANK -x CUDA_DEVICE_MAX_CONNECTIONS \
   -np $WORLD_SIZE --map-by ppr:$NPROC_PER_NODE:node --report-bindings \
-  apptainer exec --nv \
-    --bind /work/NBB/yu_mingzhe:/work/NBB/yu_mingzhe \
-    $apptainer_image \
-    torchrun \
-      --rdzv-backend=c10d \
-      --rdzv-endpoint="$MASTER_ADDR":"$MASTER_PORT" \
-      --nnodes=$NNODES \
-      --nproc-per-node=$NPROC_PER_NODE \
-      --node-rank=$NODE_RANK \
-      $script_path \
-      ${GPT_MODEL_ARGS[@]} \
-      ${TRAINING_ARGS[@]} \
-      ${MODEL_PARALLEL_ARGS[@]} \
-      ${DATA_ARGS[@]} \
-      ${EVAL_AND_LOGGING_ARGS[@]}
+  torchrun \
+    --rdzv-backend=c10d \
+    --rdzv-endpoint="$MASTER_ADDR":"$MASTER_PORT" \
+    --nnodes=$NNODES \
+    --nproc-per-node=$NPROC_PER_NODE \
+    --node-rank=$NODE_RANK \
+    $script_path \
+    ${GPT_MODEL_ARGS[@]} \
+    ${TRAINING_ARGS[@]} \
+    ${MODEL_PARALLEL_ARGS[@]} \
+    ${DATA_ARGS[@]} \
+    ${EVAL_AND_LOGGING_ARGS[@]}
