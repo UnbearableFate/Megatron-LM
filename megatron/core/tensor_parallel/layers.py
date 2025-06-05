@@ -39,6 +39,16 @@ from .mappings import (
 from .random import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
 from .utils import VocabUtility
 
+import logging
+
+logging.basicConfig(
+    filename='logfile.log',        # 指定输出文件
+    level=logging.NOTSET,            # 设置日志等级
+    format='%(asctime)s - %(levelname)s - %(message)s',  # 设置日志格式
+)
+
+logging.info('这条信息将被写入 logfile.log')
+
 _grad_accum_fusion_available = True
 try:
     import fused_weight_gradient_mlp_cuda

@@ -19,6 +19,8 @@ from .log_handler import CustomHandler
 logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
 from .theoretical_memory_usage import report_theoretical_memory
 import time
+from kfac.gpt_mega.mega_gpt_precondi import GPTMegatronKFACPreconditioner
+
 
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
@@ -1236,6 +1238,8 @@ def setup_model_and_optimizer(
         use_gloo_process_groups=args.enable_gloo_process_groups,
     )
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
+    ### insert kfac
+    preconditioner = GPTMegatronKFACPreconditioner(model=model, )
 
     if args.moe_use_upcycling:
         torch.distributed.barrier()
