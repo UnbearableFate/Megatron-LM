@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 import logging
 import os
 import warnings
@@ -18,11 +19,11 @@ from kfac.enums import AssignmentStrategy
 from kfac.enums import ComputeMethod
 from kfac.layers.base import KFACBaseLayer
 from kfac.layers.register import any_match
-from kfac.layers.register import get_flattened_modules
+from kfac.layers.register import get_flattened_modules_from_model_list
 from kfac.layers.register import requires_grad
 
-from kfac.gpt_mega.mini_eigen import MiniMLPEigen,SplitEnd
-from kfac.layers.modules import LinearModuleHelper
+from kfac.gpt_mega.mini_eigen_new import MiniMLPEigenNew,SplitEnd
+from .modules import MegaLinearModuleHelper
 
 logger = logging.getLogger(__name__)
 
@@ -154,51 +155,21 @@ class GPTMegatronKFACPreconditioner(BaseKFACPreconditioner):
 
 
         layer_kwargs = dict(
-            allreduce_method=self.allreduce_method,
+            allreduce_method=None,
             grad_scaler=self.grad_scaler,
             factor_dtype=self.factor_dtype,
             inv_dtype=self.inv_dtype,
             symmetry_aware=self.symmetry_aware,
-            tdc=self.tdc,
+            tdc=None,
         )
 
         kfac_layers = register_modules(
             model,
-            model_parallel_group=self.model_parallel_group,
             skip_layers=self.skip_layers,
             **layer_kwargs,
         )
 
-        data_parallel_ranks = [
-            -1 for _ in range(get_world_size(self.data_parallel_group))
-        ]
-        torch.distributed.all_gather_object(
-            object_list=data_parallel_ranks,
-            obj=get_rank(),
-            group=self.data_parallel_group,
-        )
-
-        for name, kfac_layer in kfac_layers.values():
-            logger.log(
-                loglevel,
-                f'Registered name="{name}": {repr(kfac_layer)} on '
-                f'global-rank={get_rank()} and '
-                f'pipeline-rank={get_rank(self.pipeline_parallel_group)}',
-            )
-
-        if self.assignment_strategy == AssignmentStrategy.COMPUTE:
-            cost_func = lambda n: n**3  # noqa: E731
-        elif self.assignment_strategy == AssignmentStrategy.MEMORY:
-            cost_func = lambda n: n**2  # noqa: E731
-        else:
-            raise AssertionError(
-                f'Unknown assignment_strategy={self.assignment_strategy}',
-            )
-
         defaults = {
-            'allreduce_bucket_cap_mb': self.allreduce_bucket_cap_mb,
-            'allreduce_method': self.allreduce_method,
-            'assignment_strategy': self.assignment_strategy,
             'compute_eigenvalue_outer_product': (
                 self.compute_eigenvalue_outer_product
             ),
@@ -210,6 +181,9 @@ class GPTMegatronKFACPreconditioner(BaseKFACPreconditioner):
             'skip_layers': self.skip_layers,
             'symmetry_aware': self.symmetry_aware,
         }
+
+        inv_update_steps = 2
+        damping = 0.007
 
         super().__init__(
             kfac_layers,
@@ -226,6 +200,48 @@ class GPTMegatronKFACPreconditioner(BaseKFACPreconditioner):
             tdc=None,
             loglevel=loglevel,
         )
+
+    @torch.no_grad()
+    def step(self) -> None:
+        """Perform one K-FAC step.
+
+        Note:
+            This function should always be called before `optimizer.step()` as
+            it modifies the gradients and does not modify the weights.
+
+        Note:
+            Gradients must be averaged across ranks before calling `step()`.
+            This condition is guaranteed to be true if using the
+            `DistributedDataParallel` model wrapper as gradients are
+            communicated during `loss.backward()`.
+        """
+        if (
+            not self._update_factors_in_hook
+            and self.steps % self.factor_update_steps == 0
+        ):
+            for name, layer in reversed(list(self._layers.values())):
+                self._mini_steps[name] = 0
+                layer.update_a_factor(alpha=self.factor_decay)
+                layer.update_g_factor(alpha=self.factor_decay)
+
+        # Flush last allreduce bucket from forward/backward pass.
+        # Will be a no-op if bucketing was not used
+
+        # Compute Inverses
+        for name, layer in reversed(list(self._layers.values())):
+            if self.steps % self.inv_update_steps == 0 and self.steps > 5:
+                layer.compute_a_inv(damping=self.damping)
+                layer.compute_g_inv(damping=self.damping)
+            layer.preconditioned_grad(damping=self.damping)
+
+        scale = None if self.kl_clip is None else self._compute_grad_scale()
+
+        # Update gradients in-place
+        for _, layer in reversed(list(self._layers.values())):
+            layer.update_grad(scale=scale)
+
+        self._steps += 1
+        self._mini_steps = defaultdict(int)
 
     def load_state_dict(
         self,
@@ -321,7 +337,49 @@ class GPTMegatronKFACPreconditioner(BaseKFACPreconditioner):
                 filepath = os.path.join(self.factor_checkpoint_dir, name)
                 logger.info(f'saving KFAC factors for {name} to {filepath}')
                 torch.save(layer_state_dict, filepath)
+    
+    @torch.no_grad()
+    def step(self) -> None:
+        """Perform one K-FAC step.
 
+        Note:
+            This function should always be called before `optimizer.step()` as
+            it modifies the gradients and does not modify the weights.
+
+        Note:
+            Gradients must be averaged across ranks before calling `step()`.
+            This condition is guaranteed to be true if using the
+            `DistributedDataParallel` model wrapper as gradients are
+            communicated during `loss.backward()`.
+        """
+        if (
+            not self._update_factors_in_hook
+            and self.steps % self.factor_update_steps == 0
+        ):
+            for name, layer in reversed(list(self._layers.values())):
+                self._mini_steps[name] = 0
+                layer.update_a_factor(alpha=self.factor_decay)
+                layer.update_g_factor(alpha=self.factor_decay)
+        
+        # Compute Inverses
+        if self.steps % self.inv_update_steps == 0 :
+            for name, layer in reversed(list(self._layers.values())):
+                layer.compute_a_inv(damping=self.damping)
+                layer.compute_g_inv(damping=self.damping)
+        
+        # Compute Preconditioned Gradients
+        for name, layer in reversed(list(self._layers.values())):
+            layer.preconditioned_grad(damping=self.damping)
+            
+        scale = None if self.kl_clip is None else self._compute_grad_scale()
+
+        # Update gradients in-place
+        for _, layer in reversed(list(self._layers.values())):
+            layer.update_grad(scale=scale)
+
+        self._steps += 1
+        self._mini_steps = defaultdict(int)
+    
 
 def register_modules(
     model: torch.nn.Module,
@@ -341,7 +399,7 @@ def register_modules(
             pass to the kfac_layer_type constructor.
     """
 
-    modules = get_flattened_modules(model)
+    modules = get_flattened_modules_from_model_list(model)
 
     kfac_layers: dict[torch.nn.Module, tuple[str, KFACBaseLayer]] = {}
     for name, module in modules:
@@ -352,20 +410,18 @@ def register_modules(
             and requires_grad(module)
         ):
             if module_name == 'ColumnParallelLinear'.lower():
-                kfac_layer = MiniMLPEigen(
-                    module= LinearModuleHelper(module),
+                kfac_layer = MiniMLPEigenNew(
+                    module= MegaLinearModuleHelper(module),
                     name=name,
                     tensor_parallel_dist_group=module.tp_group,
-                    split_end=SplitEnd.IN
-                    **layer_kwargs,
+                    split_end=SplitEnd.NONE,
                 )
             elif module_name == 'RowParallelLinear'.lower():
-                kfac_layer = MiniMLPEigen(
-                    module= LinearModuleHelper(module),
+                kfac_layer = MiniMLPEigenNew(
+                    module= MegaLinearModuleHelper(module),
                     name=name,
                     tensor_parallel_dist_group=module.tp_group,
-                    split_end=SplitEnd.OUT
-                    **layer_kwargs,
+                    split_end=SplitEnd.NONE,
                 )
             else:
                 # Add this no-op print because coverage does not like
@@ -377,6 +433,6 @@ def register_modules(
             # get_flattened_modules() should never give us modules with the
             # same name
             assert module not in kfac_layers
-            kfac_layers[module] = (name, kfac_layer)
+            kfac_layers[module] = (kfac_layer.name, kfac_layer)
 
     return kfac_layers

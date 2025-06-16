@@ -1,43 +1,41 @@
-"""Helper wrappers for supported PyTorch modules."""
-
-from __future__ import annotations
-
-import sys
-
-if sys.version_info >= (3, 9):  # pragma: >=3.9 cover
-    from typing import Literal
-else:  # pragma: <3.9 cover
-    from typing_extensions import Literal
+from typing import cast
 
 import torch
-import torch.distributed as dist
-
 from kfac.layers.modules import LinearModuleHelper
-
-
 class MegaLinearModuleHelper(LinearModuleHelper):
-    """ModuleHelper for GPTNeoX layers."""
+    """ModuleHelper for torch.nn.Linear modules."""
+    
+    def get_grad(self) -> torch.Tensor:
+        """Get formatted gradients (weight and bias) of module.
 
-    def __init__(
-        self,
-        module: torch.nn.Module,
-        model_parallel_group: dist.ProcessGroup | None,
-    ):
-        """Init ModuleHelper.
-
-        Args:
-            module (torch.nn.Module): module in model to wrap.
-            model_parallel_group (ProcessGroup): model parallel distributed
-                process group this rank belongs to. If None, it is assumed
-                model parallelism size is 1 (i.e., there is no model
-                parallelism).
-            parallelism (str): "input" if the layer is split on the input or
-                "output" if split on the output.
+        Returns:
+            gradient of shape If bias != None,
+            concats bias.
         """
-        self.module = module
-        self.model_parallel_group = model_parallel_group
-        self.model_parallel_world_size = (
-            1
-            if self.model_parallel_group is None
-            else dist.get_world_size(self.model_parallel_group)
-        )
+        g = cast(torch.Tensor, self.module.weight.main_grad)
+        if self.has_bias():
+            g = torch.cat(
+                [g, self.module.bias.main_grad.view(-1, 1)],  # type: ignore
+                1,
+            )
+        return g
+    
+    def get_bias_grad(self) -> torch.Tensor:
+        """Get the gradient of the bias."""
+        return cast(torch.Tensor, self.module.bias.main_grad)
+    
+    def get_weight_grad(self) -> torch.Tensor:
+        """Get the gradient of the weight."""
+        return cast(torch.Tensor, self.module.weight.main_grad)
+
+    def set_grad(self, grad: torch.Tensor) -> None:
+        """Update the gradient of the module."""
+        if self.has_bias():
+            weight_grad = grad[:, :-1].view(self.get_weight_grad().size())
+            bias_grad = grad[:, -1:].view(self.get_bias_grad().size())
+        else:
+            weight_grad = grad.view(self.get_weight_grad().size())
+
+        if self.has_bias():
+            self.module.bias.main_grad = bias_grad.contiguous()
+        self.module.weight.main_grad = weight_grad.contiguous()

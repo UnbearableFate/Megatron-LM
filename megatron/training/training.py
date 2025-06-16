@@ -804,7 +804,7 @@ def pretrain(
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     app_metrics['app_build_optimizer_start_time'] = one_logger_utils.get_timestamp_in_ms()
-    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
+    model, optimizer, opt_param_scheduler,preconditioner = setup_model_and_optimizer(
         model_provider, model_type, checkpointing_context=checkpointing_context
     )
 
@@ -873,6 +873,7 @@ def pretrain(
                 config,
                 checkpointing_context,
                 non_loss_data_func,
+                preconditioner=preconditioner,
             )
 
         print_datetime('after training is done')
@@ -1239,7 +1240,7 @@ def setup_model_and_optimizer(
     )
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
     ### insert kfac
-    preconditioner = GPTMegatronKFACPreconditioner(model=model, )
+    preconditioner = GPTMegatronKFACPreconditioner(model=model, skip_layers=['output_layer'])
 
     if args.moe_use_upcycling:
         torch.distributed.barrier()
@@ -1336,7 +1337,7 @@ def setup_model_and_optimizer(
         torch.distributed.barrier()
         exit()
 
-    return model, optimizer, opt_param_scheduler
+    return model, optimizer, opt_param_scheduler ,preconditioner
 
 
 def dummy_train_step(data_iterator):
@@ -1348,7 +1349,7 @@ def dummy_train_step(data_iterator):
         batch = get_batch_on_this_cp_rank(batch)
 
 
-def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config):
+def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config,preconditioner):
     """Single training step."""
     args = get_args()
     timers = get_timers()
@@ -1397,7 +1398,6 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
         return {}, True, should_checkpoint, should_exit, exit_code, None, None
-
     # Empty unused memory.
     if args.empty_unused_memory_level >= 1:
         torch.cuda.empty_cache()
@@ -1406,9 +1406,13 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
         unwrapped_model = unwrap_model(model[0])
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
-
+    
+    if preconditioner is not None:
+        timers('preconditioner', log_level=1).start(barrier=args.barrier_with_L1_time)
+        preconditioner.step()
+        timers('preconditioner').stop()
+    
     # Update parameters.
-
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
     timers('optimizer').stop()
@@ -2005,6 +2009,7 @@ def train(
     config,
     checkpointing_context,
     non_loss_data_func,
+    preconditioner=None,
 ):
     """Training function: run train_step desired number of times, run validation, checkpoint."""
     args = get_args()
@@ -2231,7 +2236,7 @@ def train(
             grad_norm,
             num_zeros_in_grad,
         ) = train_step(
-            forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config
+            forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config ,preconditioner
         )
         ft_integration.on_training_step_end()
         if should_checkpoint:

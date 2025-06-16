@@ -1,5 +1,10 @@
 #!/bin/bash
 
+# qlogin -q debug -A NBB -l elapstim_req=00:40:00 -V -b 2 -T openmpi -v NQSV_MPI_VER=5.0.7/gcc11.4.0-cuda12.8.1
+# cd /work/NBB/yu_mingzhe/Megatron-LM
+# module load openmpi/5.0.7/gcc11.4.0-cuda12.8.1
+# conda activate mega2nd
+
 # compute world size
 NNODES=$(sort -u "$PBS_NODEFILE" | wc -l)
 NPROC_PER_NODE=1
@@ -31,7 +36,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 # Change for multinode config
 
-CHECKPOINT_PATH="$WORKSPACE/output/checkpoints" #<Specify path>
+CHECKPOINT_PATH="$WORKSPACE/output/checkpoints/$timestamp" #<Specify path>
 TENSORBOARD_LOGS_PATH="$WORKSPACE/output/logs" #<Specify path>
 VOCAB_FILE="$WORKSPACE/data/vocab.json" #<Specify path to file>/gpt2-vocab.json
 MERGE_FILE="$WORKSPACE/data/merges.txt" #<Specify path to file>/gpt2-merges.txt
@@ -49,9 +54,9 @@ VAL_DATA_PATH="$WORKSPACE/data/wikitext103_validation" #<Specify path and file p
 # )
 
 GPT_MODEL_ARGS=(
-       --num-layers 6
+       --num-layers 3
        --hidden-size 256
-       --num-attention-heads 8 
+       --num-attention-heads 4
        --seq-length 1024 
        --max-position-embeddings 1024
        --transformer-impl "local"
@@ -60,18 +65,16 @@ GPT_MODEL_ARGS=(
 TRAINING_ARGS=(
     --micro-batch-size 1 
     --global-batch-size 256
-    --train-iters 3
+    --train-iters 30
     --weight-decay 0.1 
     --adam-beta1 0.9 
     --adam-beta2 0.95 
     --init-method-std 0.006 
-    --clip-grad 1.0 
-    --fp16
     --lr 6.0e-5 
     --lr-decay-style cosine 
     --min-lr 6.0e-6
     --lr-warmup-fraction .001 
-    --lr-decay-iters 50
+    --lr-decay-iters 4
 )
 
 MODEL_PARALLEL_ARGS=(
@@ -87,7 +90,7 @@ DATA_ARGS=(
 )
 
 EVAL_AND_LOGGING_ARGS=(
-    --log-interval 100
+    --log-interval 2
     --save-interval 10000 
     --eval-interval 1000 
     --save $CHECKPOINT_PATH 

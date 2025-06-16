@@ -17,3 +17,4 @@ share_files/
 data/
 output/
 checkpoints/
+*.log

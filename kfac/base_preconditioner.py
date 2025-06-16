@@ -467,8 +467,6 @@ class BaseKFACPreconditioner:
                 and self._mini_steps[name] % self._accumulation_steps == 0
             ):
                 layer.update_a_factor(alpha=self.factor_decay)
-                print("update A factor", name, layer.a_factor.shape)
-                #layer.reduce_a_factor(self._assignment.factor_group(name, 'A'))
 
     @torch.no_grad()
     def _save_grad_output(
@@ -490,5 +488,3 @@ class BaseKFACPreconditioner:
                 and self._mini_steps[name] % self._accumulation_steps == 0
             ):
                 layer.update_g_factor(alpha=self.factor_decay)
-                print("update G factor", name, layer.g_factor.shape)
-                #layer.reduce_g_factor(self._assignment.factor_group(name, 'G'))

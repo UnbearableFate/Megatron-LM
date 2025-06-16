@@ -429,7 +429,7 @@ class KFACEigenLayer(KFACBaseLayer):
             raise RuntimeError(
                 'Cannot eigendecompose G before G has been computed',
             )
-
+        
         if self.symmetric_factors:
             try:
                 self.dg, self.qg = torch.linalg.eigh(
@@ -449,7 +449,8 @@ class KFACEigenLayer(KFACBaseLayer):
                         (matrix).to(torch.float32),
                     )
                 except Exception as e:
-                    print(f"eigen g decomposition error again: {e} at {self.name} ,pass")
+                    print(f"eigen g decomposition error again: {e} at {self.name}")
+                    raise e
         else:
             try :
                 dg, qg = torch.linalg.eig(

@@ -28,6 +28,14 @@ def get_flattened_modules(
         if len(list(module.children())) == 0
     ]
 
+def get_flattened_modules_from_model_list(
+    model_list: list[torch.nn.Module],
+) -> list[tuple[str, torch.nn.Module]]:
+    """Returns flattened view of leaves of module tree from a list of models."""
+    modules = []
+    for model in model_list:
+        modules.extend(get_flattened_modules(model))
+    return modules
 
 def requires_grad(module: torch.nn.Module) -> bool:
     """Return False if any module param has requires_grad=False."""
