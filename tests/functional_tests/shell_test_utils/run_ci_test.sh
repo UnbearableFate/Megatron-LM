@@ -2,6 +2,12 @@
 
 set -exo pipefail
 
+# Increase soft limit for number of open files to match hard limit
+ulimit -Sn $(ulimit -Hn)
+
+# Increase soft limit for number of processes to match hard limit
+ulimit -Su $(ulimit -Hu)
+
 echo "------ARGUMENTS LIST --------"
 # Use eval to properly handle quoted arguments
 eval "set -- $@"
@@ -17,7 +23,7 @@ for ARGUMENT in "$@"; do
     VALUE="${VALUE#\'}"
 
     # Properly quote the value to preserve spaces and special characters
-    export "$KEY"="$VALUE"
+    export "$KEY"="$(eval echo $VALUE)"
     echo "$KEY=$VALUE"
 done
 echo "---------------------------------"
@@ -69,7 +75,7 @@ IS_NEMO_TEST=$([[ $(echo "$TRAINING_SCRIPT_PATH" | tr '[:upper:]' '[:lower:]') =
 export IS_NEMO_TEST
 
 # Adjust model_config for lightweight mode
-if [[ "$MODE" == "pretraining" ]]; then
+if [[ "$MODE" == "pretraining" && "$TEST_TYPE" != "release" ]]; then
     if [[ "$ENABLE_LIGHTWEIGHT_MODE" == "true" && "$IS_NEMO_TEST" == "true" ]]; then
         yq -i '.MODEL_ARGS."trainer.max_steps" = 2' $TRAINING_PARAMS_PATH
         TRAIN_ITERS=$(cat $TRAINING_PARAMS_PATH |
@@ -99,6 +105,11 @@ if [[ "$MODE" == "pretraining" ]]; then
     fi
 fi
 
+if [[ "$MODE" == "pretraining" && "$TEST_TYPE" = "release" ]]; then
+    TRAIN_ITERS=$(cat $TRAINING_PARAMS_PATH |
+        yq '.MODEL_ARGS."--exit-interval" // "100"')
+fi
+
 # Extract settings from params file
 NVTE_ALLOW_NONDETERMINISTIC_ALGO=$(cat $TRAINING_PARAMS_PATH |
     yq '.ENV_VARS.NVTE_ALLOW_NONDETERMINISTIC_ALGO')
@@ -118,6 +129,7 @@ for i in $(seq 1 $N_REPEAT); do
     export RUN_NUMBER=1
     export REPEAT=$i
     export CHECKPOINT_SAVE_PATH=$_CHECKPOINT_SAVE_PATH
+    export TRAINING_EXIT_CODE=0
 
     if [[ "$TEST_TYPE" = "frozen-start" ]]; then
         export CHECKPOINT_LOAD_PATH=$_CHECKPOINT_LOAD_PATH
@@ -130,38 +142,35 @@ for i in $(seq 1 $N_REPEAT); do
         export CHECKPOINT_SAVE_PATH=$_CHECKPOINT_SAVE_PATH
     fi
 
-    bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh
+    bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh || TRAINING_EXIT_CODE=$?
 
-    IS_FROZEN_RESUME_BUT_NO_CHECKPOINT=$([[ "$TEST_TYPE" = "frozen-resume" && -z "$(ls -A "$_CHECKPOINT_LOAD_PATH" 2>/dev/null)" ]] && echo "true" || echo "false")
+    if [[ "$TEST_TYPE" = "frozen-resume" && -z "$(ls -A "$_CHECKPOINT_LOAD_PATH" 2>/dev/null)" ]]; then
+        echo "No frozen checkpoint found. Will skip second run."
 
-    if [[ "$IS_FROZEN_RESUME_BUT_NO_CHECKPOINT" == "true" && ${RECORD_CHECKPOINTS} != "true" ]]; then
-        echo "No frozen checkpoint found, but test type is frozen-resume. Will abort."
-        exit 1
-    elif [[ "$IS_FROZEN_RESUME_BUT_NO_CHECKPOINT" == "true" && ${RECORD_CHECKPOINTS} == "true" ]]; then
         export CHECKPOINT_SAVE_PATH=$_CHECKPOINT_SAVE_PATH
         rm -rf "$CHECKPOINT_SAVE_PATH/iter_0000$TRAIN_ITERS"
         echo $((TRAIN_ITERS / 2)) >$CHECKPOINT_SAVE_PATH/latest_checkpointed_iteration.txt
         break
     fi
 
-    if [[ "$TEST_TYPE" == "ckpt-resume" ]]; then
+    if [[ "$TEST_TYPE" == "ckpt-resume" && "$TRAINING_EXIT_CODE" -eq 0 ]]; then
         export CHECKPOINT_LOAD_PATH=$CHECKPOINT_SAVE_PATH
 
         rm -rf "$CHECKPOINT_LOAD_PATH/iter_$(printf "%07d\n" "$TRAIN_ITERS")"
         echo $((TRAIN_ITERS / 2)) >$CHECKPOINT_LOAD_PATH/latest_checkpointed_iteration.txt
 
         export RUN_NUMBER=2
-        bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh
+        bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh || TRAINING_EXIT_CODE=$?
     fi
 
-    if [[ "$TEST_TYPE" == "frozen-resume" ]]; then
+    if [[ "$TEST_TYPE" == "frozen-resume" && "$TRAINING_EXIT_CODE" -eq 0 ]]; then
 
         # Checkpoint-resume tests load from prev run
         export CHECKPOINT_LOAD_PATH=$_CHECKPOINT_LOAD_PATH
         export CHECKPOINT_SAVE_PATH=/tmp/checkpoints/
 
         export RUN_NUMBER=2
-        bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh
+        bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh || TRAINING_EXIT_CODE=$?
 
         export CHECKPOINT_SAVE_PATH=$_CHECKPOINT_SAVE_PATH
         rm -rf "$CHECKPOINT_SAVE_PATH/iter_0000$TRAIN_ITERS"
@@ -170,7 +179,6 @@ for i in $(seq 1 $N_REPEAT); do
 
     if [[ "$TEST_TYPE" == "release" ]]; then
         SKIP_PYTEST=1
-        TRAIN_ITERS=10000000
     fi
 
     if [[ ${RECORD_CHECKPOINTS} == "true" ]]; then
@@ -190,7 +198,7 @@ for i in $(seq 1 $N_REPEAT); do
         # Read test values from Tensorboard for non-inference tests.
         # Inference tests will load from JSON instead.
         if [[ "$MODE" == "pretraining" ]]; then
-            python3 $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
+            uv run python $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
                 --logs-dir $TENSORBOARD_PATH \
                 --train-iters $TRAIN_ITERS \
                 --output-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
@@ -201,7 +209,7 @@ for i in $(seq 1 $N_REPEAT); do
     # Maybe run tests
     if [[ ${SKIP_PYTEST:-0} == 1 ]]; then
         echo Skipping Pytest checks.
-        exit 0
+        exit ${TRAINING_EXIT_CODE}
     fi
 
     if [[ ! " ${TEST_TYPES[*]} " =~ " ${TEST_TYPE} " ]]; then
@@ -220,16 +228,17 @@ for i in $(seq 1 $N_REPEAT); do
     echo "Running pytest checks against golden values"
 
     # For pretraining jobs
-    if [[ "$MODE" == "pretraining" ]]; then
-        pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_regular_pipeline.py \
+    if [[ "$MODE" == "pretraining" && "$TRAINING_EXIT_CODE" -eq 0 ]]; then
+        uv run pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_regular_pipeline.py \
             --golden-values-path $GOLDEN_VALUES_PATH \
             --tensorboard-path $TENSORBOARD_PATH \
+            --train-iters $TRAIN_ITERS \
             --model-config-path ${TRAINING_PARAMS_PATH} \
             $ALLOW_NONDETERMINISTIC_ALGO_ARG
 
         if [[ "$TEST_TYPE" == "ckpt-resume" || "$TEST_TYPE" == "frozen-resume" ]]; then
             echo "Running pytest 1st vs 2nd run comparison"
-            pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_resume_checkpoint_pipeline.py \
+            uv run pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_resume_checkpoint_pipeline.py \
                 --tensorboard-path $TENSORBOARD_PATH \
                 --train-iters $TRAIN_ITERS \
                 --model-config-path ${TRAINING_PARAMS_PATH} \
@@ -240,12 +249,18 @@ for i in $(seq 1 $N_REPEAT); do
     # For inference jobs
     if [[ "$MODE" == "inference" ]]; then
         if [[ "$TEST_TYPE" == "frozen-start" ]]; then
-            pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_inference_regular_pipeline.py \
+            uv run pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_inference_regular_pipeline.py \
                 --golden-values-path $GOLDEN_VALUES_PATH \
                 --test-values-path $TENSORBOARD_PATH \
                 --model-config-path ${TRAINING_PARAMS_PATH} \
                 $ALLOW_NONDETERMINISTIC_ALGO_ARG
         fi
+    fi
+
+    # Abort if training failed
+    if [[ "$TRAINING_EXIT_CODE" -ne 0 && "$TEST_TYPE" != "release" ]]; then
+        echo "Training failed. Aborting."
+        exit 1
     fi
 
 done

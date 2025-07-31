@@ -19,7 +19,13 @@ except ImportError:
     HAVE_DTENSOR = False
 
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing import ShardedTensor, load, remove_sharded_tensors, save
+from megatron.core.dist_checkpointing import (
+    ShardedTensor,
+    load,
+    load_content_metadata,
+    remove_sharded_tensors,
+    save,
+)
 from megatron.core.dist_checkpointing.core import CheckpointingException, maybe_load_config
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensorFactory
@@ -132,37 +138,59 @@ class TestSerialization:
 
     def test_multi_process_save_log_difference(self, tmp_path_dist_ckpt, caplog):
         Utils.initialize_model_parallel(2, 4)
+        rank = Utils.rank
+        world_size = Utils.world_size
 
         state_dict = {
             'sd_keyA': ShardedTensor.from_rank_offsets(
-                'keyA', torch.ones(2, 4), (0, Utils.rank, Utils.world_size)
+                'keyA', torch.ones(2, 4), (0, rank, world_size)
             ),
             'sd_keyB': ShardedTensor.from_rank_offsets(
-                'keyB', torch.ones(3, 5, 7), (2, Utils.rank, Utils.world_size)
+                'keyB', torch.ones(3, 5, 7), (2, rank, world_size)
             ),
-            'rank': torch.distributed.get_rank(),
+            'rank': rank,
         }
 
         def preprocess_fn(x):
             return x
 
-        with caplog.at_level(logging.WARNING):
-            # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
-            with TempNamedDir(
-                tmp_path_dist_ckpt / 'test_multi_process_save', sync=True
-            ) as ckpt_dir:
+        # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_multi_process_save_log_difference', sync=True
+        ) as ckpt_dir:
+            with caplog.at_level(logging.WARNING):
                 save(
                     state_dict,
                     ckpt_dir,
                     validate_access_integrity=True,
                     preprocess_common_before_consistancy_check=preprocess_fn,
                 )
-            # pylint: disable=line-too-long
-            if torch.distributed.get_rank() == 0:
-                assert (
-                    "There is difference in the common state dict in different ranks. The differences are {1: ([], [], [(('rank',), <class 'int'>, <class 'int'>)]), 2: ([], [], [(('rank',), <class 'int'>, <class 'int'>)]), 3: ([], [], [(('rank',), <class 'int'>, <class 'int'>)]), 4: ([], [], [(('rank',), <class 'int'>, <class 'int'>)]), 5: ([], [], [(('rank',), <class 'int'>, <class 'int'>)]), 6: ([], [], [(('rank',), <class 'int'>, <class 'int'>)]), 7: ([], [], [(('rank',), <class 'int'>, <class 'int'>)])}"
-                    in caplog.text
-                )
+
+        if rank == 0:
+            # Rank 0 should not log the warning related to common state dict difference
+            assert not any(
+                f"Rank {rank} common state dict differs from rank 0 common state dict."
+                in record.message
+                for record in caplog.records
+            )
+        else:
+            found_detailed_match = False
+            # Construct the expected full message string based on user request
+            expected_full_message = (
+                f"Rank {rank} common state dict differs from rank 0 common state dict. "
+                f"Keys only on rank 0: [], "
+                f"Keys only on {rank}: [], "
+                f"Mismatched keys: [(('rank',), <class 'int'>, <class 'int'>)]"
+            )
+
+            for record in caplog.records:
+                if record.message == expected_full_message:
+                    found_detailed_match = True
+                    break
+
+            assert (
+                found_detailed_match
+            ), f"Did not find expected log message format for mismatch on rank {rank}. Expected: {expected_full_message}"
 
         Utils.destroy_model_parallel()
 
@@ -601,6 +629,39 @@ class TestSerialization:
                 ]  # rank 3 held the main replica so did the saving
 
         Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize(
+        'content_metadata', [{'a': 3}, {'nested': {'a': 3}, 'flat': (5, {6: None})}, {}]
+    )
+    def test_content_metadata_load_from_checkpoint(self, tmp_path_dist_ckpt, content_metadata):
+        Utils.initialize_model_parallel(1, 1)
+        state_dict = {'common': (3, 5, 7)}
+
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_content_metadata_load_from_checkpoint', sync=True
+        ) as ckpt_dir:
+            save(state_dict, ckpt_dir, content_metadata=content_metadata)
+            torch.distributed.barrier()
+            loaded_metadata = load_content_metadata(ckpt_dir)
+
+        assert loaded_metadata == content_metadata
+
+    @pytest.mark.parametrize(
+        'content_metadata', [{'a': 3}, {'nested': {'a': 3}, 'flat': (5, {6: None})}, {}]
+    )
+    def test_content_metadata_load_from_state_dict(self, tmp_path_dist_ckpt, content_metadata):
+        Utils.initialize_model_parallel(1, 1)
+        state_dict = {'common': (3, 5, 7)}
+
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_content_metadata_load_from_state_dict', sync=True
+        ) as ckpt_dir:
+            save(state_dict, ckpt_dir, content_metadata=content_metadata)
+            torch.distributed.barrier()
+            loaded_state_dict = load(state_dict, ckpt_dir)
+            loaded_metadata = load_content_metadata(preloaded_state_dict=loaded_state_dict)
+
+        assert loaded_metadata == content_metadata
 
 
 class TestNonStrictLoad:

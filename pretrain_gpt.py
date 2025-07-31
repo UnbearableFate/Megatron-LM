@@ -1,6 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
-"""Pretrain GPT."""
+"""Pretrain and SFT GPT."""
 
 import datetime
 import os
@@ -40,6 +40,7 @@ from megatron.training.utils import (
     get_blend_and_blend_per_split,
 )
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
+from megatron.training.datasets.sft_dataset import SFTDataset
 
 import megatron.legacy.model  # isort: skip
 
@@ -55,6 +56,40 @@ except ImportError:
     has_nvidia_modelopt = False
 
 stimer = StragglerDetector()
+
+
+def _get_transformer_layer_spec(use_te, config):
+    """Get transformer layer specification based on configuration.
+    
+    Args:
+        use_te (bool): Whether to use Transformer Engine
+        args: Training arguments
+        config: Model configuration
+        
+    Returns:
+        transformer_layer_spec: The transformer layer specification
+    """
+    args = get_args()
+    if use_te:
+        return get_gpt_layer_with_transformer_engine_spec(
+            args.num_experts,
+            args.moe_grouped_gemm,
+            args.qk_layernorm,
+            args.multi_latent_attention,
+            args.moe_use_legacy_grouped_gemm,
+            qk_l2_norm=args.qk_l2_norm,
+            use_kitchen=config.use_kitchen,
+        )
+    else:
+        return get_gpt_layer_local_spec(
+            args.num_experts,
+            args.moe_grouped_gemm,
+            args.qk_layernorm,
+            args.multi_latent_attention,
+            args.moe_use_legacy_grouped_gemm,
+            normalization=args.normalization,
+            use_kitchen=config.use_kitchen,
+        )
 
 
 def model_provider(
@@ -123,33 +158,23 @@ def model_provider(
             if args.num_experts:
                 # Define the decoder block spec
                 transformer_layer_spec = get_gpt_decoder_block_spec(
-                    config, use_transformer_engine=use_te, normalization=args.normalization, vp_stage=vp_stage
+                    config, use_transformer_engine=use_te, normalization=args.normalization, qk_l2_norm=args.qk_l2_norm, vp_stage=vp_stage
                 )
             elif args.heterogeneous_layers_config_path is not None:
                 transformer_layer_spec = get_gpt_heterogeneous_layer_spec(config, use_te)
             else:
                 # Define the decoder layer spec
-                if use_te:
-                    transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-                        args.num_experts,
-                        args.moe_grouped_gemm,
-                        args.qk_layernorm,
-                        args.multi_latent_attention,
-                        args.moe_use_legacy_grouped_gemm,
-                    )
-                else:
-                    transformer_layer_spec = get_gpt_layer_local_spec(
-                        args.num_experts,
-                        args.moe_grouped_gemm,
-                        args.qk_layernorm,
-                        args.multi_latent_attention,
-                        args.moe_use_legacy_grouped_gemm,
-                        normalization=args.normalization,
-                    )
+                transformer_layer_spec = _get_transformer_layer_spec(use_te, config)
         mtp_block_spec = None
         if args.mtp_num_layers is not None:
+            if hasattr(transformer_layer_spec, 'layer_specs') and len(transformer_layer_spec.layer_specs) == 0:
+                # Get the decoder layer spec explicitly if no decoder layer in the last stage,
+                # Only happens with block spec (TransformerBlockSubmodules) when using MoE.
+                transformer_layer_spec_for_mtp = _get_transformer_layer_spec(use_te, config)
+            else:
+                transformer_layer_spec_for_mtp = transformer_layer_spec
             mtp_block_spec = get_gpt_mtp_block_spec(
-                config, transformer_layer_spec, use_transformer_engine=use_te
+                config, transformer_layer_spec_for_mtp, use_transformer_engine=use_te, vp_stage=vp_stage
             )
 
         model = GPTModel(
@@ -330,10 +355,13 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
     config = core_gpt_dataset_config_from_args(args)
 
-    if args.mock_data:
-        dataset_type = MockGPTDataset
+    if args.sft:
+        dataset_type = SFTDataset
     else:
-        dataset_type = GPTDataset
+        if args.mock_data:
+            dataset_type = MockGPTDataset
+        else:
+            dataset_type = GPTDataset
 
     print_rank_0("> building train, validation, and test datasets for GPT ...")
 

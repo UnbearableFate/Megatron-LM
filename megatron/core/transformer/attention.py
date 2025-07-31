@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import NoReturn, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -28,6 +28,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import (
     deprecate_inference_params,
     divide,
+    get_pg_size,
     is_fa_min_version,
     nvtx_range_pop,
     nvtx_range_push,
@@ -135,7 +136,7 @@ class Attention(MegatronModule, ABC):
         self.model_comm_pgs = model_comm_pgs
 
         # Per attention head and per partition values
-        world_size = self.model_comm_pgs.tp.size()
+        world_size = get_pg_size(self.model_comm_pgs.tp)
         self.hidden_size_per_attention_head = divide(
             self.query_projection_size, self.config.num_attention_heads
         )
@@ -330,8 +331,18 @@ class Attention(MegatronModule, ABC):
             # Flash Decoding assumes that the keys stored in the KV Cache already have RoPE applied.
             # Apply RoPE before we store the keys to make it compatible with flash decoding kernel
             if rotary_pos_sin_q is not None and rotary_pos_sin_k is not None:
-                key = apply_rotary_pos_emb_with_cos_sin(key, rotary_pos_cos_k, rotary_pos_sin_k)
-                query = apply_rotary_pos_emb_with_cos_sin(query, rotary_pos_cos_q, rotary_pos_sin_q)
+                key = apply_rotary_pos_emb_with_cos_sin(
+                    key,
+                    rotary_pos_cos_k,
+                    rotary_pos_sin_k,
+                    rotary_interleaved=self.config.rotary_interleaved,
+                )
+                query = apply_rotary_pos_emb_with_cos_sin(
+                    query,
+                    rotary_pos_cos_q,
+                    rotary_pos_sin_q,
+                    rotary_interleaved=self.config.rotary_interleaved,
+                )
         else:
             rotary_pos_cos_q = None
             rotary_pos_sin_q = None
@@ -387,6 +398,7 @@ class Attention(MegatronModule, ABC):
         inference_value_memory: Tensor,
         rotary_cos: Tensor,
         rotary_sin: Tensor,
+        rotary_interleaved: bool = False,
     ) -> (Tensor, Tensor):
         """
         The flash decoding kernel will do the following in a single execution:
@@ -418,7 +430,7 @@ class Attention(MegatronModule, ABC):
             rotary_cos=rotary_cos,
             rotary_sin=rotary_sin,
             cache_seqlens=sequence_len_offset,
-            rotary_interleaved=False,
+            rotary_interleaved=rotary_interleaved,
         )
         return out
 
@@ -432,7 +444,6 @@ class Attention(MegatronModule, ABC):
         cu_seqlens_q,
         cu_seqlens_k,
         seqlens_k,
-        seqlens_k_decode_only,
         block_table,
     ) -> Tensor:
         """Flash attention kernel for mixed decode and prefill samples.
@@ -446,7 +457,6 @@ class Attention(MegatronModule, ABC):
             cu_seqlens_q (Tensor): Cumulative query sequence lengths.
             cu_seqlens_k (Tensor): Cumulative key sequence lengths.
             seqlens_k (Tensor): key sequence lengths.
-            seqlens_k_decode_only (Tensor): key sequence lengths (decode_only).
             block_table (Tensor): KV cache chunk ids for all samples.
         Return:
             (Tensor) Attention output.
@@ -514,7 +524,7 @@ class Attention(MegatronModule, ABC):
                 "q": q,
                 "k_cache": k,
                 "v_cache": v,
-                "cache_seqlens": seqlens_k_decode_only,
+                "cache_seqlens": seqlens_k,
                 "causal": True,
                 "page_table" if HAVE_FA3 else "block_table": block_table,
             }
@@ -599,16 +609,16 @@ class Attention(MegatronModule, ABC):
         # Adjust key, value, and rotary_pos_emb for inference
         # ===================================================
 
+        in_decode_mode = (
+            inference_context is not None
+            and inference_context.is_decode_only()
+            and not self.training
+        )
+
         # This branch only runs in the decode phase of flash decoding and returns after the linear
         # projection. This conditional is not used in the prefill phase or non-flash-decoding cases.
         nvtx_range_push(suffix="adjust_key_value")
-        if (
-            self.config.flash_decode
-            and inference_context is not None
-            and inference_context.is_decode_only()
-            and not self.training
-            and rotary_pos_cos is not None
-        ):
+        if in_decode_mode and self.config.flash_decode:
             assert self.layer_number in inference_context.key_value_memory_dict
             assert inference_context.sequence_len_offset is not None
             inference_key_memory, inference_value_memory = inference_context.key_value_memory_dict[
@@ -623,11 +633,19 @@ class Attention(MegatronModule, ABC):
                 inference_value_memory=inference_value_memory,
                 rotary_cos=rotary_pos_cos,
                 rotary_sin=rotary_pos_sin,
+                rotary_interleaved=self.config.rotary_interleaved,
             )
             out = output.transpose(0, 1).contiguous()
             context_layer = out.view(out.size(0), out.size(1), -1)
             output, bias = self.linear_proj(context_layer)
             return output, bias
+
+        if (
+            in_decode_mode
+            and self.config.enable_cuda_graph
+            and inference_context.is_static_batching()
+        ):
+            raise ValueError(f"CUDA graphs must use flash decode with static batching!")
 
         query, key, value, rotary_pos_emb, attn_mask_type, block_table = (
             self._adjust_key_value_for_inference(
@@ -728,9 +746,7 @@ class Attention(MegatronModule, ABC):
                 # Dynamic batching attention kernel.
                 q, k, v = (query, key, value)
                 cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
-                cu_kv_lengths, kv_lengths, kv_lengths_decode_only, max_seqlen_k = (
-                    inference_context.cu_kv_lengths()
-                )
+                cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
 
                 core_attn_out = self.flash_decode_and_prefill(
                     q,
@@ -741,7 +757,6 @@ class Attention(MegatronModule, ABC):
                     cu_query_lengths,
                     cu_kv_lengths,
                     kv_lengths,
-                    kv_lengths_decode_only,
                     block_table,
                 )
                 core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
@@ -947,6 +962,19 @@ class SelfAttention(Attention):
             self.run_realtime_tests()
 
         return query, key, value
+
+    def backward_dw(self) -> NoReturn:
+        """Execute weight update operations"""
+        self._backward_qkv_proj()
+        self._backward_output_proj()
+
+    def _backward_qkv_proj(self):
+        """Update weights for QKV projection layer"""
+        self.linear_qkv.backward_dw()
+
+    def _backward_output_proj(self):
+        """Update weights for output projection layer"""
+        self.linear_proj.backward_dw()
 
 
 class CrossAttention(Attention):

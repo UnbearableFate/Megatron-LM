@@ -6,13 +6,15 @@ import pytest
 import torch
 from packaging import version
 
-from megatron.core import parallel_state
+import megatron.core.parallel_state as parallel_state
+from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -22,7 +24,12 @@ class TestParallelAttention:
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
         self.transformer_config = TransformerConfig(
-            num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
         )
         self.parallel_attention = SelfAttention(
             self.transformer_config,
@@ -38,7 +45,7 @@ class TestParallelAttention:
         assert self.parallel_attention.layer_number == 1
 
         num_weights = sum([p.numel() for p in self.parallel_attention.parameters()])
-        assert num_weights == 648
+        assert num_weights == 66304
 
     def test_cpu_forward(self):
         # we can't currently do this because the global memory buffer is on GPU
@@ -54,7 +61,8 @@ class TestParallelAttention:
 
         # [sequence length, batch size, hidden size]
         hidden_states = torch.ones(
-            (sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size)
+            (sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size),
+            dtype=torch.bfloat16,
         )
         hidden_states = hidden_states.cuda()
 
@@ -68,6 +76,7 @@ class TestParallelAttention:
         assert output.shape[2] == config.hidden_size
         assert bias.shape[0] == config.hidden_size
 
+    @pytest.mark.skipif(not is_te_min_version("1.4.0"), reason="Fused RoPE requires TE >= 1.4.0")
     def test_fused_rope_gpu_forward(self):
         self.parallel_attention.config.apply_rope_fusion = True
         config = self.parallel_attention.config
@@ -78,7 +87,8 @@ class TestParallelAttention:
 
         # [sequence length, batch size, hidden size]
         hidden_states = torch.ones(
-            (sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size)
+            (sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size),
+            dtype=torch.bfloat16,
         )
         hidden_states = hidden_states.cuda()
 
@@ -114,7 +124,8 @@ class TestParallelAttention:
 
         # [sequence length, batch size, hidden size]
         hidden_states = torch.ones(
-            (sequence_length, micro_batch_size, checkpointed_parallel_attention.config.hidden_size)
+            (sequence_length, micro_batch_size, checkpointed_parallel_attention.config.hidden_size),
+            dtype=torch.bfloat16,
         )
         hidden_states = hidden_states.cuda()
 
@@ -139,8 +150,13 @@ class TestSelfAttention:
         Utils.destroy_model_parallel()
 
     def run_self_attention(self, model_comm_pgs):
+        tensor_model_parallel_size = torch.distributed.get_world_size(model_comm_pgs.tp)
         self.transformer_config = TransformerConfig(
-            num_layers=2, hidden_size=128, num_attention_heads=4, use_cpu_initialization=False
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            tensor_model_parallel_size=tensor_model_parallel_size,
+            use_cpu_initialization=False,
         )
         self.self_attention = SelfAttention(
             self.transformer_config,
@@ -172,7 +188,6 @@ class TestSelfAttention:
         assert bias.shape[0] == config.hidden_size
 
     @pytest.mark.internal
-    @pytest.mark.flaky
     def test_self_attention_mpu(self):
 
         tp_size = 4
@@ -194,7 +209,6 @@ class TestSelfAttention:
         version.parse(torch.__version__) < version.parse('2.3.0'),
         reason="Device mesh feature requires PyTorch 2.3 or later",
     )
-    @pytest.mark.flaky
     @pytest.mark.internal
     def test_self_attention_independent_pg_smoke(self):
 
@@ -205,13 +219,16 @@ class TestSelfAttention:
         )
         model_parallel_cuda_manual_seed(123)
 
-        # Create device mesh for TP and CP groups
-        device_mesh = torch.distributed.init_device_mesh(
-            "cuda", (tp_size, cp_size), mesh_dim_names=("tp", "cp")
-        )
-        # Get TP and CP process groups from device mesh
-        tp_group = device_mesh.get_group(mesh_dim="tp")
-        cp_group = device_mesh.get_group(mesh_dim="cp")
+        # Initialize torch.distributed if not already initialized
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend='nccl')
+
+        # Create HyperCommGrid with dimensions cp, tp (reversed from device mesh order)
+        grid = HyperCommGrid([cp_size, tp_size], ["cp", "tp"])
+
+        # Get TP and CP process groups from HyperCommGrid
+        tp_group = grid.create_pg("tp")
+        cp_group = grid.create_pg("cp")
 
         model_comm_pgs = ModelCommProcessGroups(tp=tp_group, cp=cp_group)
 

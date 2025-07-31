@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-
+import gc
+import logging
 import warnings
 from dataclasses import dataclass
 from typing import Optional, Union
@@ -25,6 +26,16 @@ from megatron.core.utils import (
     nvtx_range_pop,
     nvtx_range_push,
 )
+
+try:
+    import transformer_engine  # pylint: disable=unused-import
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
+
+
+logger = logging.getLogger(__name__)
 
 
 # pylint: disable=missing-class-docstring
@@ -93,7 +104,7 @@ class MLP(MegatronModule):
             bias=self.config.add_bias_linear,
             skip_bias_add=True,
             is_expert=is_expert,
-            tp_comm_buffer_name='fc1',
+            tp_comm_buffer_name="fc1",
             tp_group=tp_group,
         )
 
@@ -109,7 +120,7 @@ class MLP(MegatronModule):
             input_is_parallel=True,
             skip_bias_add=True,
             is_expert=is_expert,
-            tp_comm_buffer_name='fc2',
+            tp_comm_buffer_name="fc2",
             tp_group=tp_group,
         )
 
@@ -147,6 +158,9 @@ class MLP(MegatronModule):
                         intermediate_parallel,
                         bias_parallel,
                         self.config.activation_func_fp8_input_store,
+                        self.config.cpu_offloading
+                        and self.config.cpu_offloading_activations
+                        and HAVE_TE,
                     )
                 else:
                     raise ValueError("Only support fusion of gelu and swiglu")
@@ -181,14 +195,14 @@ class MLP(MegatronModule):
 
     # pylint: disable=missing-function-docstring
     def sharded_state_dict(
-        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
+        self, prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
         sharded_state_dict = {}
         for name, module in self._modules.items():
-            sub_sd = module.sharded_state_dict(f'{prefix}{name}.', sharded_offsets, metadata)
-            if self.config.gated_linear_unit and name == 'linear_fc1':
+            sub_sd = module.sharded_state_dict(f"{prefix}{name}.", sharded_offsets, metadata)
+            if self.config.gated_linear_unit and name == "linear_fc1":
                 for k, v in sub_sd.items():
-                    if k in (f'{prefix}{name}.weight', f'{prefix}{name}.bias'):
+                    if k in (f"{prefix}{name}.weight", f"{prefix}{name}.bias"):
                         sub_sd[k] = apply_swiglu_sharded_factory(v, sharded_offsets)
             sharded_state_dict.update(sub_sd)
         return sharded_state_dict
@@ -301,7 +315,17 @@ def apply_swiglu_sharded_factory(original_sh_ten, sharded_offsets):
 
     def sh_ten_merge_fn(sub_state_dict):
         with torch.no_grad():
-            return torch.cat(sub_state_dict)
+            try:
+                return torch.cat(sub_state_dict)
+            except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+                logger.warning(
+                    f"CUDA OutOfMemoryError encountered during tensors merging."
+                    f" Switching to CPU merge. (Error: {e})"
+                )
+                merged_sub_state_dict = torch.cat([t.cpu() for t in sub_state_dict])
+                gc.collect()
+                torch.cuda.empty_cache()
+                return merged_sub_state_dict
 
     return ShardedTensorFactory(
         original_sh_ten.key,
