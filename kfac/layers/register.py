@@ -11,7 +11,6 @@ from kfac.layers.base import KFACBaseLayer
 from kfac.layers.modules import Conv2dModuleHelper
 from kfac.layers.modules import LinearModuleHelper
 from kfac.layers.modules import ModuleHelper
-from kfac.layers.dia_eigen import DiaMLPEigen
 
 KNOWN_MODULES = {'linear', 'conv2d'}
 LINEAR_TYPES: tuple[type[torch.nn.Module], ...] = (torch.nn.Linear,)
@@ -93,15 +92,8 @@ def register_modules(
             module_helper = get_module_helper(module)
             if module_helper is None:
                 continue
-            """
             kfac_layer = kfac_layer_type(module_helper, **layer_kwargs)
             kfac_layer.name = name
-            """
-            if isinstance(module_helper, LinearModuleHelper):
-                kfac_layer = DiaMLPEigen(module_helper,name, **layer_kwargs)
-            else:
-                kfac_layer = kfac_layer_type(module_helper, **layer_kwargs)
-                kfac_layer.name = name
             # get_flattened_modules() should never give us modules with the
             # same name
             assert module not in kfac_layers

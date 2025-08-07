@@ -24,7 +24,7 @@ class KFACEigenLayer(KFACBaseLayer):
         self,
         module: ModuleHelper,
         *,
-        tdc: TorchDistributedCommunicator,
+        tdc: TorchDistributedCommunicator = None,
         allreduce_method: AllreduceMethod = AllreduceMethod.ALLREDUCE,
         factor_dtype: torch.dtype | None = None,
         grad_scaler: (

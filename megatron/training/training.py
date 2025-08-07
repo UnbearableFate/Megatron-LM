@@ -1256,7 +1256,7 @@ def setup_model_and_optimizer(
     )
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
     ### insert kfac
-    preconditioner = GPTMegatronKFACPreconditioner(model=model, skip_layers=['output_layer'])
+    preconditioner = None # GPTMegatronKFACPreconditioner(model=model, skip_layers=['output_layer'],inv_update_steps=50,damping=0.001)
 
     if args.moe_use_upcycling:
         torch.distributed.barrier()

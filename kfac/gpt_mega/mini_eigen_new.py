@@ -1,3 +1,4 @@
+from torch import Tensor, inf
 from kfac.layers.eigen import *
 from kfac.layers.modules import get_cov, append_bias_ones
 
@@ -37,7 +38,8 @@ class MiniMLPEigenNew(KFACEigenLayer):
         self,
         module: ModuleHelper,
         name: str,
-        tensor_parallel_dist_group: dist.ProcessGroup | None = None,
+        para_type: str,
+        tensor_parallel_dist_group: dist.ProcessGroup = dist.group.WORLD,
         split_end: SplitEnd = SplitEnd.BOTH,
         *,
         factor_dtype: torch.dtype | None = None,
@@ -79,6 +81,7 @@ class MiniMLPEigenNew(KFACEigenLayer):
         chunk_rank = dist.get_rank(self.tp_group) if self.tp_group is not None else 0
         group_size = dist.get_world_size(self.tp_group) if self.tp_group is not None else 1
         self.name = name + f"_chunk{chunk_rank}"
+        self.parallel_type = para_type
         self.chunk_rank = chunk_rank
         self.grp_size = group_size
 
@@ -174,6 +177,15 @@ class MiniMLPEigenNew(KFACEigenLayer):
         return start, end
 
     def save_layer_input(self, input_: list[torch.Tensor]) -> None:
+        """
+        if self.parallel_type == "ColumnParallelLinear":
+            input_tensor = input_[0].clone()
+            dist.all_reduce(input_tensor, op=dist.ReduceOp.SUM)
+            if torch.allclose(input_tensor , input_[0] * dist.get_world_size(), rtol=1e-5, atol=1e-5):
+                print(f"Input is the same at layer {self.name} at prehook.")
+            else:
+                print(f"Input is NOT the same at layer {self.name} at prehook.")
+        """
         if not self.split_in:
             super().save_layer_input(input_)
             return
@@ -212,7 +224,15 @@ class MiniMLPEigenNew(KFACEigenLayer):
         if not self.split_out:
             super().save_layer_grad_output(grad_output)
             return
-        """Save grad w.r.t outputs for layer."""
+        
+        """
+        all_grad = grad_output[0].clone()
+        dist.all_reduce(all_grad, op=dist.ReduceOp.SUM)
+        if torch.allclose(all_grad, grad_output[0] * dist.get_world_size(), rtol=1e-5, atol=1e-5):
+            print(f"Grad output is the same at layer {self.name} at back hook.")
+        else:
+            print(f"Grad output is NOT the same at layer {self.name} at back hook.")
+        """
         g = grad_output[0][..., self.output_chunk_start : self.output_chunk_end].to(
             self.factor_dtype
         )
@@ -259,7 +279,7 @@ class MiniMLPEigenNew(KFACEigenLayer):
         self.a_inv_local = torch.mm(F, self.qa.t())  # 整体乘一次
         self.qa = None
         self.da = None
-
+        self.a_inv_local = MinMaxNormalization(self.a_inv_local)
         if self.split_in:
             self.all_gather_a_inv_tensors()
 
@@ -271,7 +291,7 @@ class MiniMLPEigenNew(KFACEigenLayer):
         self.g_inv_local = Qg_scaled @ self.qg.t()
         self.qg = None
         self.dg = None
-
+        self.g_inv_local = MinMaxNormalization(self.g_inv_local)
         if self.split_out:
             self.all_gather_g_inv_tensors()
 
@@ -330,17 +350,49 @@ class MiniMLPEigenNew(KFACEigenLayer):
             else:
                 # Block-diagonal left multiplication
                 self.grad = block_diag_right_mm(self.g_inv_local @ grad, self.a_inv_gathered)
-                
         elif self.split_out:
             # Block-diagonal right multiplication
             self.grad = block_diag_left_mm(self.g_inv_gathered, grad) @ self.a_inv_local
-            
         else:
             # Full matrix multiplication
             self.grad = self.g_inv_local @ grad @ self.a_inv_local
+            self.grad = self.grad.to(grad_type)
+            return
         # self.grad.mul_(0.5).add_(grad, alpha=0.5).to(dtype=grad_type)  # Add damping to the gradient
         self.grad.add_(grad).mul_(0.5).to(dtype=grad_type)  # Add damping to the gradient
 
+def smart_detect_inf(tensor: Tensor) -> Tensor:
+    """
+    Replaces positive infinity in the tensor with 1. and negative infinity with 0..
+    
+    Parameters:
+    tensor (torch.Tensor): Input tensor that can have any dimension.
+    
+    Returns:
+    torch.Tensor: A tensor with the same shape, dtype, and device as the input, where
+                  positive infinities are replaced by 1. and negative infinities by 0..
+    """
+    result_tensor = tensor.clone()
+    result_tensor[tensor == inf] = 1.
+    result_tensor[tensor == -inf] = 0.
+    return result_tensor
+
+def MinMaxNormalization(tensor: Tensor, epsilon: float = 1e-6) -> Tensor:
+    """
+    Scales tensor values to range [0,1] using min-max normalization.
+
+    Args:
+        tensor: Input tensor
+        epsilon: Small value to prevent division by zero (default: 1e-6)
+    
+    Returns:
+        Normalized tensor with values in [0,1]
+    """
+    tensor = smart_detect_inf(tensor)
+    min_tensor = tensor.min()
+    max_tensor = tensor.max()
+    range_tensor = max_tensor - min_tensor
+    return tensor.add_(-min_tensor).div_(range_tensor + epsilon)
 
 def block_diag_left_and_right(
     A_blocks: torch.Tensor,

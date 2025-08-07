@@ -15,7 +15,7 @@ MASTER_ADDR=$(head -n 1 "$PBS_NODEFILE")
 MASTER_PORT=6003
 
 # compute local node-rank
-hosts=( $(sort -u "$PBS_NODEFILE") )
+hosts=( $(sort -u -r "$PBS_NODEFILE") )
 NODE_RANK=0
 for idx in "${!hosts[@]}"; do
   if [[ "${hosts[idx]}" == "$(hostname)" ]]; then
@@ -65,7 +65,7 @@ GPT_MODEL_ARGS=(
 TRAINING_ARGS=(
     --micro-batch-size 1 
     --global-batch-size 256
-    --train-iters 30
+    --train-iters 3
     --weight-decay 0.1 
     --adam-beta1 0.9 
     --adam-beta2 0.95 
@@ -78,7 +78,7 @@ TRAINING_ARGS=(
 )
 
 MODEL_PARALLEL_ARGS=(
-    --tensor-model-parallel-size 2
+    --tensor-model-parallel-size $WORLD_SIZE
     --pipeline-model-parallel-size 1
 )
 

@@ -2,8 +2,8 @@
 #PBS -A NBB
 #PBS -q gpu
 #PBS -T openmpi
-#PBS -b 8
-#PBS -l elapstim_req=00:40:00
+#PBS -b 1
+#PBS -l elapstim_req=01:00:00
 #PBS -v NQSV_MPI_VER=5.0.7/gcc11.4.0-cuda12.8.1
 #PBS -M kanakawapanman@gmail.com
 
@@ -42,18 +42,18 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 # Change for multinode config
 
 CHECKPOINT_PATH="$WORKSPACE/output/checkpoints/$timestamp" #<Specify path>
-TENSORBOARD_LOGS_PATH="$WORKSPACE/output/logs/$timestamp" #<Specify path>
+TENSORBOARD_LOGS_PATH="$WORKSPACE/output/logs/single/$timestamp" #<Specify path>
 VOCAB_FILE="$WORKSPACE/data/vocab.json" #<Specify path to file>/gpt2-vocab.json
 MERGE_FILE="$WORKSPACE/data/merges.txt" #<Specify path to file>/gpt2-merges.txt
 TRAIN_DATA_PATH="$WORKSPACE/data/wikitext103_train" #<Specify path and file prefix>_text_document
 VAL_DATA_PATH="$WORKSPACE/data/wikitext103_validation" #<Specify path and file prefix>_text_document
 
 GPT_MODEL_ARGS=(
-       --num-layers 12
-       --hidden-size 512
-       --num-attention-heads 8
-       --seq-length 1024
-       --max-position-embeddings 1024
+       --num-layers 3
+       --hidden-size 256
+       --num-attention-heads 4
+       --seq-length 512
+       --max-position-embeddings 512
        --transformer-impl "local"
 )
 
@@ -68,12 +68,13 @@ TRAINING_ARGS=(
     --lr 6.0e-5 
     --lr-decay-style cosine 
     --min-lr 6.0e-6
-    --lr-warmup-fraction .001 
     --lr-decay-iters 430
+    --lr-warmup-fraction 0.2
+    --lr-warmup-init 6.0e-6
 )
 
 MODEL_PARALLEL_ARGS=(
-    --tensor-model-parallel-size 8
+    --tensor-model-parallel-size $WORLD_SIZE
     --pipeline-model-parallel-size 1
 )
 
@@ -92,6 +93,7 @@ EVAL_AND_LOGGING_ARGS=(
     --load $CHECKPOINT_PATH 
     --eval-iters 3
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
+    --log-memory-to-tensorboard
 )
 
 # Run the script with MPI

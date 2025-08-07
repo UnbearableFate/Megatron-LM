@@ -22,7 +22,7 @@ from kfac.layers.register import any_match
 from kfac.layers.register import get_flattened_modules_from_model_list
 from kfac.layers.register import requires_grad
 
-from kfac.gpt_mega.mini_eigen_new import MiniMLPEigenNew,SplitEnd
+from kfac.gpt_mega.mini_eigen_new import MiniMLPEigenNew,SplitEnd,KFACEigenLayer
 from .modules import MegaLinearModuleHelper
 
 logger = logging.getLogger(__name__)
@@ -200,49 +200,27 @@ class GPTMegatronKFACPreconditioner(BaseKFACPreconditioner):
             tdc=None,
             loglevel=loglevel,
         )
-
-    @torch.no_grad()
-    def step(self) -> None:
-        """Perform one K-FAC step.
-
-        Note:
-            This function should always be called before `optimizer.step()` as
-            it modifies the gradients and does not modify the weights.
-
-        Note:
-            Gradients must be averaged across ranks before calling `step()`.
-            This condition is guaranteed to be true if using the
-            `DistributedDataParallel` model wrapper as gradients are
-            communicated during `loss.backward()`.
         """
-        if (
-            not self._update_factors_in_hook
-            and self.steps % self.factor_update_steps == 0
-        ):
-            for name, layer in reversed(list(self._layers.values())):
-                self._mini_steps[name] = 0
-                layer.update_a_factor(alpha=self.factor_decay)
-                layer.update_g_factor(alpha=self.factor_decay)
+        def check_input_same(
+            module: torch.nn.Module,
+            input_: list[torch.Tensor],
+            output: list[torch.Tensor] | None = None,
+        ) -> None:
+            '''Hook for saving the input during the forward pass of a module.'''
+            input_tensor = input_[0] if isinstance(input_, list) else input_
+            input_tensor = input_tensor[0]
+            all_input = input_tensor.clone().detach()
+            torch.distributed.all_reduce(all_input)
+            if torch.allclose(all_input, input_tensor * torch.distributed.get_world_size(), rtol=1e-5, atol=1e-5):
+                print(f"Input is the same at layer {self._layers[module][0]} at hook.")
+            else:
+                print(f"Input is NOT the same at layer {self._layers[module][0]} at hook.")
 
-        # Flush last allreduce bucket from forward/backward pass.
-        # Will be a no-op if bucketing was not used
-
-        # Compute Inverses
-        for name, layer in reversed(list(self._layers.values())):
-            if self.steps % self.inv_update_steps == 0 and self.steps > 5:
-                layer.compute_a_inv(damping=self.damping)
-                layer.compute_g_inv(damping=self.damping)
-            layer.preconditioned_grad(damping=self.damping)
-
-        scale = None if self.kl_clip is None else self._compute_grad_scale()
-
-        # Update gradients in-place
-        for _, layer in reversed(list(self._layers.values())):
-            layer.update_grad(scale=scale)
-
-        self._steps += 1
-        self._mini_steps = defaultdict(int)
-
+        for name, layer in self._layers.values():
+            layer : MiniMLPEigenNew
+            if layer.parallel_type == "ColumnParallelLinear":
+                layer.module.module.register_forward_hook(check_input_same)
+        """
     def load_state_dict(
         self,
         state_dict: dict[str, Any],
@@ -415,6 +393,7 @@ def register_modules(
                     name=name,
                     tensor_parallel_dist_group=module.tp_group,
                     split_end=SplitEnd.NONE,
+                    para_type="ColumnParallelLinear"
                 )
             elif module_name == 'RowParallelLinear'.lower():
                 kfac_layer = MiniMLPEigenNew(
@@ -422,12 +401,13 @@ def register_modules(
                     name=name,
                     tensor_parallel_dist_group=module.tp_group,
                     split_end=SplitEnd.NONE,
+                    para_type="RowParallelLinear"
                 )
             else:
                 # Add this no-op print because coverage does not like
                 # a bare else: continue block even though it can be proved
                 # the continue is executed
-                print('', end='\n')
+                logger.debug(f'No KFAC layer registered for {module_name}')
                 continue
 
             # get_flattened_modules() should never give us modules with the
